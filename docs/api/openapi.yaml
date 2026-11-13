@@ -1,0 +1,2393 @@
+openapi: 3.1.0
+info:
+  title: Harbour API
+  version: 1.0.0
+  summary: Customer chat, staff console, admin dashboards and the audit log for a Nigerian retail copilot.
+  description: |
+    Fictional data only. The client is Sample Retail Ltd, with three fictional branches.
+
+    **Money** is integer kobo (fields end in `_kobo`). The apps show naira (1 naira = 100 kobo).
+    **Times** are ISO 8601 in UTC. The apps show Africa/Lagos.
+    **IDs** are UUIDs, except for an audit event's `id`, which is an integer.
+
+    **Roles.** Customer, staff, admin and super-admin are separate roles, checked on the server.
+    - Customers use an HTTP-only session cookie (`harbour_session`), set when the chat starts.
+    - Staff, admins and the super-admin use a bearer token from `POST /v1/auth/login`.
+
+    **Errors.** Every error body is `{"code", "message"}`. Validation errors also carry `fields`.
+    Unknown IDs return 404, business-rule failures return 409, invalid input returns 422.
+
+    **Refunds** are recorded and approved in Harbour, but no money moves. The assistant never writes to the database.
+
+    **Daily refund limits.** Each staff member and admin has a daily refund limit. Remaining today is the limit,
+    minus refunds they approved today (Lagos day), minus open refund requests assigned to them now.
+    The limit is checked when the agent routes a refund, when an admin assigns one by hand, and when it is approved.
+  contact:
+    name: Harbour team
+  x-status: draft-for-team-review
+servers:
+- url: /
+  description: Relative to the host that serves this file.
+tags:
+- name: Customer chat
+- name: Customer identity
+- name: Customer orders and stock
+- name: Customer tickets and refunds
+- name: Staff queue
+- name: Staff drafts and feedback
+- name: Staff analytics
+- name: Admin documents
+- name: Admin dashboards
+- name: Accounts and auth
+- name: Approval limits
+- name: Audit log
+- name: Health
+security:
+- sessionCookie: []
+- bearerAuth: []
+paths:
+  /health:
+    get:
+      tags:
+      - Health
+      operationId: getLive
+      security: []
+      summary: 'Liveness: the API process is running (H1)'
+      description: Does not check the database. Use it to decide whether to restart the process.
+      responses:
+        '200':
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/ready:
+    get:
+      tags:
+      - Health
+      operationId: getReady
+      security: []
+      summary: 'Readiness of the API service: ready only when the database answers (H2)'
+      description: Covers the API service and the database only. It does not check the knowledge or assistant services; see `/health/services` for those. Not versioned, so probes do
+        not change with the API version.
+      responses:
+        '200':
+          description: The API can reach the database.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database does not answer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: DATABASE_UNAVAILABLE
+                message: The database did not answer.
+  /health/services:
+    get:
+      tags:
+      - Health
+      operationId: getServicesHealth
+      summary: Status of each part of Harbour, separately (H3). Admins only.
+      description: Reports the database, the knowledge service and the assistant service separately, so an operator can tell which part is down. `overall` is `down` when the database
+        is down, and `degraded` when only the knowledge or assistant service is down. Customer order and stock lookups and staff ticket work still run when `degraded`. Admins only, because
+        it shows internal structure.
+      responses:
+        '200':
+          description: The status of each component. Returned even when a component is down.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServicesHealth'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/conversations:
+    post:
+      tags:
+      - Customer chat
+      operationId: startConversation
+      summary: Start a chat (C1). Sets the session cookie.
+      security: []
+      responses:
+        '201':
+          description: Conversation started.
+          headers:
+            Set-Cookie:
+              description: Sets `harbour_session` (HTTP-only, Secure, SameSite=Lax).
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/conversations/{conversation_id}/messages:
+    parameters:
+    - $ref: '#/components/parameters/ConversationId'
+    post:
+      tags:
+      - Customer chat
+      operationId: sendMessage
+      summary: Send a message and get the answer (C2)
+      description: |
+        The assistant answers from the published document version for the customer's branch,
+        with citations. If no passage supports an answer, `abstained` is true and a ticket is opened.
+        If the model fails, the response says a person will reply, and a ticket is opened.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MessageCreate'
+      responses:
+        '201':
+          description: The customer message and the assistant's reply.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageExchange'
+        '404':
+          $ref: '#/components/responses/ConversationNotFound'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+        '503':
+          description: The assistant is unavailable. A ticket was opened and a person will reply.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: ASSISTANT_UNAVAILABLE
+                message: A person will reply shortly.
+  /v1/identity/codes:
+    post:
+      tags:
+      - Customer identity
+      operationId: requestIdentityCode
+      summary: Send a one-time code to the phone on file (C3)
+      description: |
+        The reply is the same whether or not the number is on file, so the endpoint does not reveal who is a customer.
+        Codes expire after 10 minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdentityCodeRequest'
+      responses:
+        '202':
+          description: Accepted. If the number is on file, a code was sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+        '429':
+          $ref: '#/components/responses/TooManyAttempts'
+  /v1/identity/verify:
+    post:
+      tags:
+      - Customer identity
+      operationId: verifyIdentityCode
+      summary: Check the one-time code (C4)
+      description: |
+        Three wrong codes lock the check for 30 minutes (Q5). A wrong code returns `401`.
+        While locked, every attempt returns `429`. A correct code marks the session as verified.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IdentityVerifyRequest'
+      responses:
+        '200':
+          description: Verified. The session can now read its own orders.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          description: Wrong code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_CODE
+                message: The code is wrong.
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+        '429':
+          $ref: '#/components/responses/TooManyAttempts'
+  /v1/orders/{order_number}:
+    parameters:
+    - $ref: '#/components/parameters/OrderNumber'
+    get:
+      tags:
+      - Customer orders and stock
+      operationId: getOrderStatus
+      summary: Order status for a verified customer (C5)
+      description: |
+        Returns 404 for orders that belong to someone else, so the response does not reveal
+        whether the order exists.
+      responses:
+        '200':
+          description: The order status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+  /v1/branches/{branch_code}/stock/{sku}:
+    parameters:
+    - $ref: '#/components/parameters/BranchCode'
+    - $ref: '#/components/parameters/Sku'
+    get:
+      tags:
+      - Customer orders and stock
+      operationId: getBranchStock
+      summary: Stock at one branch, with the import time (C6)
+      description: Read-only. The quantity may be out of date. The answer shows `last_imported_at`.
+      responses:
+        '200':
+          description: Stock at the branch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stock'
+        '404':
+          $ref: '#/components/responses/StockNotFound'
+  /v1/tickets:
+    get:
+      tags:
+      - Staff queue
+      operationId: listMyQueue
+      summary: The signed-in staff member's queue (S1)
+      description: |
+        Tickets and refund requests the agent or an admin routed to the signed-in person, sorted by urgency.
+        Cursor pagination (Q11): pass the `next_cursor` from one page to get the next.
+      parameters:
+      - name: assigned_to
+        in: query
+        required: true
+        description: Always `me`. Staff see only their own queue.
+        schema:
+          type: string
+          enum:
+          - me
+      - name: status
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/TicketStatus'
+      - name: urgency
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/Urgency'
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of the queue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+    post:
+      tags:
+      - Customer tickets and refunds
+      operationId: openTicket
+      summary: Open a ticket (C7)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TicketCreate'
+      responses:
+        '201':
+          description: Ticket opened.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedId'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/refund-requests:
+    post:
+      tags:
+      - Customer tickets and refunds
+      operationId: requestRefund
+      summary: Request a refund (C8). Prepared and routed, never paid.
+      description: |
+        Requires a verified session (C4). The `Idempotency-Key` header makes a retry return the first result (Q10).
+        The request is routed by the agent (section 6 of the team overview).
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        description: A client-generated unique key for this request. A repeat returns the first result.
+        schema:
+          type: string
+          minLength: 8
+          maxLength: 64
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequestCreate'
+      responses:
+        '201':
+          description: Refund request created, with status `pending_approval`.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/tickets/{ticket_id}:
+    parameters:
+    - $ref: '#/components/parameters/TicketId'
+    get:
+      tags:
+      - Staff queue
+      operationId: getTicket
+      summary: One ticket with its conversation and the passages used (S2)
+      responses:
+        '200':
+          description: The ticket and its conversation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketDetail'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+  /v1/tickets/{ticket_id}/draft-replies:
+    parameters:
+    - $ref: '#/components/parameters/TicketId'
+    post:
+      tags:
+      - Staff drafts and feedback
+      operationId: createDraftReply
+      summary: Ask for a draft reply with citations (S3). Never sent automatically.
+      responses:
+        '201':
+          description: The draft.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DraftReply'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '503':
+          $ref: '#/components/responses/AssistantUnavailable'
+  /v1/draft-replies/{draft_id}/send:
+    parameters:
+    - $ref: '#/components/parameters/DraftId'
+    post:
+      tags:
+      - Staff drafts and feedback
+      operationId: sendDraftReply
+      summary: Send a reviewed draft (S4)
+      description: |
+        The draft's status changes to `sent` in the same transaction. A second send returns `409 ALREADY_SENT` (Q10).
+        The send is audited with the staff member's ID.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DraftEdit'
+      responses:
+        '200':
+          description: The draft, now sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DraftReply'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DraftNotFound'
+        '409':
+          description: The draft was already sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: ALREADY_SENT
+                message: This draft was already sent.
+  /v1/refund-requests/{refund_request_id}/decision:
+    parameters:
+    - $ref: '#/components/parameters/RefundRequestId'
+    post:
+      tags:
+      - Staff queue
+      operationId: decideRefundRequest
+      summary: Approve, reject or ask for detail (S5)
+      description: |
+        The amount must fit in the approver's remaining daily limit. Otherwise the decision is refused with
+        `403 APPROVAL_LIMIT_EXCEEDED`. Approved amounts are recorded for finance to pay outside Harbour.
+        Nothing is paid by Harbour.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundDecision'
+      responses:
+        '200':
+          description: The refund request, with its new status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefundRequest'
+        '403':
+          description: Forbidden, or the amount is above the approver's remaining daily limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                limit:
+                  value:
+                    code: APPROVAL_LIMIT_EXCEEDED
+                    message: This amount is above your remaining limit for today.
+                role:
+                  value:
+                    code: FORBIDDEN
+                    message: Your role cannot do this.
+        '404':
+          $ref: '#/components/responses/RefundRequestNotFound'
+        '409':
+          description: The request was already decided.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: ALREADY_DECIDED
+                message: This request was already decided.
+  /v1/sop/questions:
+    post:
+      tags:
+      - Staff drafts and feedback
+      operationId: askSopAssistant
+      summary: Ask the SOP assistant (S6). Answers from SOP documents, with citations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SopQuestion'
+      responses:
+        '200':
+          description: The answer, with citations, or an abstention.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SopAnswer'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+        '503':
+          $ref: '#/components/responses/AssistantUnavailable'
+  /v1/feedback:
+    post:
+      tags:
+      - Staff drafts and feedback
+      operationId: submitFeedback
+      summary: Mark a draft as wrong, or save a case for testing (S8)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedbackCreate'
+      responses:
+        '201':
+          description: Feedback saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedId'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/analytics/stock:
+    get:
+      tags:
+      - Staff analytics
+      operationId: listStock
+      summary: Read-only stock figures (S7)
+      parameters:
+      - name: branch
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 20
+      responses:
+        '200':
+          description: Stock figures, with the import time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StockList'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/analytics/sales:
+    get:
+      tags:
+      - Staff analytics
+      operationId: listSales
+      summary: Read-only sales by branch and day (S9). From the daily import.
+      parameters:
+      - name: branch
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 20
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      responses:
+        '200':
+          description: Sales by branch and day.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SalesList'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/documents/{doc_key}/versions:
+    parameters:
+    - $ref: '#/components/parameters/DocKey'
+    post:
+      tags:
+      - Admin documents
+      operationId: uploadDocumentVersion
+      summary: Upload a new version as a draft (A1)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/DocumentUpload'
+      responses:
+        '201':
+          description: The new draft version.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentVersion'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/documents/{doc_key}/versions/{version}/publish:
+    parameters:
+    - $ref: '#/components/parameters/DocKey'
+    - $ref: '#/components/parameters/VersionNumber'
+    post:
+      tags:
+      - Admin documents
+      operationId: publishDocumentVersion
+      summary: Publish a version (A2). Blocked if the eval gate fails.
+      description: |
+        Before the eval gate exists (Week 19), this returns `501 NOT_IMPLEMENTED`, so nobody relies on it (Q12).
+        Once the gate exists, a failed gate returns `409 EVAL_GATE_FAILED` with the failing cases in `fields`.
+      responses:
+        '200':
+          description: The version is published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentVersion'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DocumentNotFound'
+        '409':
+          description: The eval gate failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: EVAL_GATE_FAILED
+                message: The eval gate failed. See the listed cases.
+        '501':
+          description: The eval gate is not built yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NOT_IMPLEMENTED
+                message: Publishing waits for the eval gate.
+  /v1/documents/{doc_key}/rollback:
+    parameters:
+    - $ref: '#/components/parameters/DocKey'
+    post:
+      tags:
+      - Admin documents
+      operationId: rollbackDocument
+      summary: Roll back to the previous published version in one step (A3)
+      responses:
+        '200':
+          description: The previous version is live again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentVersion'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/DocumentNotFound'
+        '409':
+          description: There is no earlier published version to roll back to.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NO_PREVIOUS_VERSION
+                message: There is no earlier published version.
+  /v1/dashboards/quality:
+    get:
+      tags:
+      - Admin dashboards
+      operationId: getQualityDashboard
+      summary: Citation and abstention rates, and response times (A4)
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      responses:
+        '200':
+          description: Quality figures.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QualityDashboard'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/dashboards/cost:
+    get:
+      tags:
+      - Admin dashboards
+      operationId: getCostDashboard
+      summary: Cost per conversation (A5). The API returns kobo; the dashboard shows naira.
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      responses:
+        '200':
+          description: Cost figures.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostDashboard'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/auth/login:
+    post:
+      tags:
+      - Accounts and auth
+      operationId: login
+      summary: Log in with email and password (R1)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: A bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: Wrong email or password.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_CREDENTIALS
+                message: Email or password is wrong.
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/auth/logout:
+    post:
+      tags:
+      - Accounts and auth
+      operationId: logout
+      summary: End the session (R2)
+      responses:
+        '204':
+          description: Logged out.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/auth/refresh:
+    post:
+      tags:
+      - Accounts and auth
+      operationId: refreshToken
+      summary: Get a new token (R3)
+      responses:
+        '200':
+          description: A new bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /v1/admin-accounts:
+    post:
+      tags:
+      - Accounts and auth
+      operationId: createAdminAccount
+      summary: Create an admin account (R4). Super-admin only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountCreate'
+      responses:
+        '201':
+          description: Admin account created.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedId'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/EmailTaken'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/staff-accounts:
+    post:
+      tags:
+      - Accounts and auth
+      operationId: createStaffAccount
+      summary: Create a staff account (R5). Admins only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountCreate'
+      responses:
+        '201':
+          description: Staff account created.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedId'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/EmailTaken'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/users/{user_id}/approval-limit:
+    parameters:
+    - $ref: '#/components/parameters/UserId'
+    put:
+      tags:
+      - Approval limits
+      operationId: setDailyLimit
+      summary: Set a staff member's or admin's daily refund limit (R6). Super-admin only.
+      description: |
+        `daily_limit_kobo: null` removes the limit, so the person can never be routed a refund.
+        Every change is written to the audit log.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DailyLimitUpdate'
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserLimit'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/tickets/{ticket_id}/eligible-assignees:
+    parameters:
+    - $ref: '#/components/parameters/TicketId'
+    get:
+      tags:
+      - Approval limits
+      operationId: listEligibleAssignees
+      summary: Staff and admins who can take this item now, lowest load first (R10). Admins only.
+      responses:
+        '200':
+          description: Eligible people.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EligibleAssigneeList'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+  /v1/tickets/{ticket_id}/assign:
+    parameters:
+    - $ref: '#/components/parameters/TicketId'
+    post:
+      tags:
+      - Approval limits
+      operationId: assignTicket
+      summary: Assign an unassigned ticket or refund request by hand (R9). Admins only.
+      description: |
+        The server checks eligibility and locks that person's record in the same save, so the agent cannot
+        route to them in between. If the check fails, nothing is saved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignRequest'
+      responses:
+        '200':
+          description: Assigned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketSummary'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/TicketNotFound'
+        '409':
+          description: The person is no longer eligible, or the item is already assigned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                notEligible:
+                  value:
+                    code: ASSIGNEE_NOT_ELIGIBLE
+                    message: This person no longer has enough daily limit for this amount.
+                alreadyAssigned:
+                  value:
+                    code: ALREADY_ASSIGNED
+                    message: This item was already assigned.
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/limit-increase-requests:
+    post:
+      tags:
+      - Approval limits
+      operationId: requestLimitIncrease
+      summary: Ask for a higher daily limit for yourself (R11). Admins only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LimitIncreaseCreate'
+      responses:
+        '201':
+          description: Request filed. Status is `pending`.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedId'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/RefundRequestNotFound'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+    get:
+      tags:
+      - Approval limits
+      operationId: listLimitIncreaseRequests
+      summary: List limit-increase requests and their decisions (R12)
+      description: Admins see their own requests. The super-admin sees all of them.
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - pending
+          - approved
+          - rejected
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of requests.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LimitIncreasePage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/limit-increase-requests/{request_id}/decision:
+    parameters:
+    - $ref: '#/components/parameters/LimitRequestId'
+    post:
+      tags:
+      - Approval limits
+      operationId: decideLimitIncrease
+      summary: Approve or reject a limit-increase request (R13). Super-admin only.
+      description: Approving sets the requester's daily limit to the requested amount, in the same audit entry as R6.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LimitIncreaseDecision'
+      responses:
+        '200':
+          description: The decided request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LimitIncrease'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/LimitRequestNotFound'
+        '409':
+          description: The request was already decided.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: ALREADY_DECIDED
+                message: This request was already decided.
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/audit-logs:
+    get:
+      tags:
+      - Audit log
+      operationId: listAuditEvents
+      summary: Read the company audit log, newest first (R7). Admins and super-admin only.
+      parameters:
+      - name: from
+        in: query
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - name: to
+        in: query
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - name: actor_id
+        in: query
+        required: false
+        schema:
+          type: string
+          format: uuid
+      - name: action
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 80
+      - name: entity_type
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 80
+      - name: entity_id
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 80
+      - $ref: '#/components/parameters/Cursor'
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of audit events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+  /v1/audit-logs/export:
+    get:
+      tags:
+      - Audit log
+      operationId: exportAuditEvents
+      summary: Download the audit log as CSV (R8). Writes its own audit event.
+      description: Same fields and filters as R7. The export records who exported, the date range and the row count.
+      parameters:
+      - name: from
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date-time
+      - name: to
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date-time
+      - name: actor_id
+        in: query
+        required: false
+        schema:
+          type: string
+          format: uuid
+      - name: action
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 80
+      - name: entity_type
+        in: query
+        required: false
+        schema:
+          type: string
+          maxLength: 80
+      responses:
+        '200':
+          description: The CSV file.
+          content:
+            text/csv:
+              schema:
+                type: string
+              example: |
+                id,occurred_at,actor_user_id,actor_role,action,entity_type,entity_id,outcome,changed_fields,ip_address,request_id
+                884213,2026-11-07T09:14:22Z,3f2c8e1a-0000-4000-8000-000000000001,staff,refund_request.approved,refund_request,1187,success,"[""status""]",102.89.0.10,req_9c1
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidInput'
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: harbour_session
+      description: Customer session. Set by `POST /v1/conversations`. A verified session (after C4) can read its own orders.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Staff, admin and super-admin token from `POST /v1/auth/login`.
+  headers:
+    Location:
+      description: URL of the created resource.
+      schema:
+        type: string
+        format: uri-reference
+  parameters:
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TicketId:
+      name: ticket_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DraftId:
+      name: draft_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RefundRequestId:
+      name: refund_request_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    LimitRequestId:
+      name: request_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OrderNumber:
+      name: order_number
+      in: path
+      required: true
+      description: The customer-facing order number, e.g. `SR-004821`.
+      schema:
+        type: string
+        pattern: ^SR-\d{6}$
+    BranchCode:
+      name: branch_code
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: ^BR-[A-Z0-9]{2,6}$
+        examples:
+        - BR-PH1
+    Sku:
+      name: sku
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 40
+        examples:
+        - SKU-123
+    DocKey:
+      name: doc_key
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 80
+    VersionNumber:
+      name: version
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `next_cursor` of the previous page. Omit for the first page.
+      schema:
+        type: string
+        maxLength: 200
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Maximum 100.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+  responses:
+    InvalidInput:
+      description: Validation failed. `fields` names each bad field.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: INVALID_INPUT
+            message: Some fields need fixing.
+            fields:
+              phone: must be a Nigerian mobile number
+    Unauthorized:
+      description: No valid session or token.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHENTICATED
+            message: Please log in again.
+    Forbidden:
+      description: The role cannot do this.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: FORBIDDEN
+            message: Your role cannot do this.
+    TooManyAttempts:
+      description: Too many attempts. The check is locked for 30 minutes.
+      headers:
+        Retry-After:
+          description: Seconds until the next attempt is allowed.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: TOO_MANY_ATTEMPTS
+            message: Too many attempts. Try again in 30 minutes.
+    ConversationNotFound:
+      description: No conversation with this ID for this session.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: CONVERSATION_NOT_FOUND
+            message: No conversation found.
+    OrderNotFound:
+      description: No order with this number for this verified customer.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: ORDER_NOT_FOUND
+            message: No order found.
+    StockNotFound:
+      description: No stock record for this branch and SKU.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: STOCK_NOT_FOUND
+            message: No stock record for this branch and item.
+    TicketNotFound:
+      description: No ticket with this ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: TICKET_NOT_FOUND
+            message: No ticket found.
+    DraftNotFound:
+      description: No draft with this ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: DRAFT_NOT_FOUND
+            message: No draft found.
+    RefundRequestNotFound:
+      description: No refund request with this ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: REFUND_REQUEST_NOT_FOUND
+            message: No refund request found.
+    DocumentNotFound:
+      description: No document or version with this key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: DOCUMENT_NOT_FOUND
+            message: No document found.
+    UserNotFound:
+      description: No user with this ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: USER_NOT_FOUND
+            message: No user found.
+    LimitRequestNotFound:
+      description: No limit-increase request with this ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: LIMIT_REQUEST_NOT_FOUND
+            message: No request found.
+    EmailTaken:
+      description: An account with this email already exists.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: EMAIL_TAKEN
+            message: An account with this email already exists.
+    AssistantUnavailable:
+      description: The assistant is unavailable. A person will reply.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: ASSISTANT_UNAVAILABLE
+            message: The assistant is unavailable. A person will reply.
+  schemas:
+    Error:
+      type: object
+      required:
+      - code
+      - message
+      properties:
+        code:
+          type: string
+          description: Stable code. Clients branch on this, not on `message`.
+          enum:
+          - UNAUTHENTICATED
+          - FORBIDDEN
+          - INVALID_INPUT
+          - INVALID_CREDENTIALS
+          - INVALID_CODE
+          - TOO_MANY_ATTEMPTS
+          - CONVERSATION_NOT_FOUND
+          - ORDER_NOT_FOUND
+          - STOCK_NOT_FOUND
+          - TICKET_NOT_FOUND
+          - DRAFT_NOT_FOUND
+          - REFUND_REQUEST_NOT_FOUND
+          - DOCUMENT_NOT_FOUND
+          - USER_NOT_FOUND
+          - LIMIT_REQUEST_NOT_FOUND
+          - EMAIL_TAKEN
+          - ALREADY_SENT
+          - ALREADY_DECIDED
+          - ALREADY_ASSIGNED
+          - ASSIGNEE_NOT_ELIGIBLE
+          - APPROVAL_LIMIT_EXCEEDED
+          - EVAL_GATE_FAILED
+          - NO_PREVIOUS_VERSION
+          - NOT_IMPLEMENTED
+          - ASSISTANT_UNAVAILABLE
+          - DATABASE_UNAVAILABLE
+        message:
+          type: string
+          description: Human-readable text. May change between versions.
+        fields:
+          type: object
+          description: Only on INVALID_INPUT and EVAL_GATE_FAILED. Maps each field (or failing case) to its problem.
+          additionalProperties:
+            type: string
+    CreatedId:
+      type: object
+      required:
+      - id
+      properties:
+        id:
+          type: string
+          format: uuid
+    Accepted:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - accepted
+          - verified
+    Conversation:
+      type: object
+      required:
+      - id
+      - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+    MessageCreate:
+      type: object
+      required:
+      - text
+      - language
+      additionalProperties: false
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        language:
+          type: string
+          enum:
+          - en
+          - pcm
+          description: English or Nigerian Pidgin (Q8).
+    Citation:
+      type: object
+      required:
+      - document_title
+      - version
+      - section
+      properties:
+        document_title:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+        section:
+          type: string
+    Message:
+      type: object
+      required:
+      - id
+      - role
+      - text
+      - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum:
+          - customer
+          - assistant
+          - staff
+        text:
+          type: string
+        language:
+          type: string
+          enum:
+          - en
+          - pcm
+        citations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Citation'
+        abstained:
+          type: boolean
+          description: True when the assistant did not answer from the documents. A ticket is opened.
+        created_at:
+          type: string
+          format: date-time
+    MessageExchange:
+      type: object
+      required:
+      - customer_message
+      - reply
+      properties:
+        customer_message:
+          $ref: '#/components/schemas/Message'
+        reply:
+          $ref: '#/components/schemas/Message'
+    IdentityCodeRequest:
+      type: object
+      required:
+      - phone
+      additionalProperties: false
+      properties:
+        phone:
+          type: string
+          pattern: ^\+?234\d{10}$
+          description: Nigerian mobile number, with or without +234.
+    IdentityVerifyRequest:
+      type: object
+      required:
+      - phone
+      - code
+      additionalProperties: false
+      properties:
+        phone:
+          type: string
+          pattern: ^\+?234\d{10}$
+        code:
+          type: string
+          pattern: ^\d{6}$
+    Order:
+      type: object
+      required:
+      - order_number
+      - status
+      - last_updated_at
+      properties:
+        order_number:
+          type: string
+        status:
+          type: string
+          enum:
+          - placed
+          - packed
+          - dispatched
+          - delivered
+          - cancelled
+        last_updated_at:
+          type: string
+          format: date-time
+    Stock:
+      type: object
+      required:
+      - branch_code
+      - sku
+      - quantity
+      - last_imported_at
+      properties:
+        branch_code:
+          type: string
+        sku:
+          type: string
+        quantity:
+          type: integer
+          minimum: 0
+        last_imported_at:
+          type: string
+          format: date-time
+          description: Shown to the customer. Stock may be stale if this is more than 24 hours ago.
+    StockList:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Stock'
+    SalesRow:
+      type: object
+      required:
+      - date
+      - branch_code
+      - orders_count
+      - sales_kobo
+      properties:
+        date:
+          type: string
+          format: date
+        branch_code:
+          type: string
+        orders_count:
+          type: integer
+          minimum: 0
+        sales_kobo:
+          type: integer
+          minimum: 0
+    SalesList:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SalesRow'
+    TicketCreate:
+      type: object
+      required:
+      - summary
+      additionalProperties: false
+      properties:
+        conversation_id:
+          type: string
+          format: uuid
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        reason:
+          type: string
+          enum:
+          - customer_request
+          - complaint
+          - unclear
+          - other
+    RefundRequestCreate:
+      type: object
+      required:
+      - order_number
+      - amount_kobo
+      - reason
+      - item
+      additionalProperties: false
+      properties:
+        order_number:
+          type: string
+          pattern: ^SR-\d{6}$
+        amount_kobo:
+          type: integer
+          minimum: 1
+        item:
+          type: string
+          minLength: 1
+          maxLength: 200
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+    RefundRequest:
+      type: object
+      required:
+      - id
+      - order_number
+      - amount_kobo
+      - status
+      - assigned_to
+      - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        order_number:
+          type: string
+        amount_kobo:
+          type: integer
+          minimum: 1
+        item:
+          type: string
+        reason:
+          type: string
+        status:
+          type: string
+          enum:
+          - pending_approval
+          - approved
+          - rejected
+          - needs_detail
+        policy_unclear:
+          type: boolean
+          description: True when the assistant could not match a return policy. Staff see this flag.
+        assigned_to:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: Null while unassigned. Unassigned requests are in the admin queue.
+        created_at:
+          type: string
+          format: date-time
+    RefundDecision:
+      type: object
+      required:
+      - decision
+      additionalProperties: false
+      properties:
+        decision:
+          type: string
+          enum:
+          - approved
+          - rejected
+          - needs_detail
+        note:
+          type: string
+          maxLength: 1000
+    TicketStatus:
+      type: string
+      enum:
+      - open
+      - in_progress
+      - resolved
+      - closed
+    Urgency:
+      type: string
+      enum:
+      - low
+      - normal
+      - high
+      - urgent
+    TicketSummary:
+      type: object
+      required:
+      - id
+      - type
+      - status
+      - urgency
+      - assigned_to
+      - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+          - support
+          - refund
+        status:
+          $ref: '#/components/schemas/TicketStatus'
+        urgency:
+          $ref: '#/components/schemas/Urgency'
+        assigned_to:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        suggested_category:
+          type: string
+          description: The agent's triage suggestion. Staff confirm or change it.
+        created_at:
+          type: string
+          format: date-time
+    TicketPage:
+      type: object
+      required:
+      - items
+      - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TicketSummary'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Null on the last page.
+    TicketDetail:
+      allOf:
+      - $ref: '#/components/schemas/TicketSummary'
+      - type: object
+        properties:
+          messages:
+            type: array
+            items:
+              $ref: '#/components/schemas/Message'
+          verified_order:
+            $ref: '#/components/schemas/Order'
+          passages_used:
+            type: array
+            items:
+              $ref: '#/components/schemas/Citation'
+    DraftReply:
+      type: object
+      required:
+      - id
+      - ticket_id
+      - body
+      - citations
+      - status
+      properties:
+        id:
+          type: string
+          format: uuid
+        ticket_id:
+          type: string
+          format: uuid
+        body:
+          type: string
+        citations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Citation'
+        status:
+          type: string
+          enum:
+          - draft
+          - sent
+        sent_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    DraftEdit:
+      type: object
+      additionalProperties: false
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          description: Optional. The staff member's edited text, sent in place of the draft.
+    SopQuestion:
+      type: object
+      required:
+      - question
+      additionalProperties: false
+      properties:
+        question:
+          type: string
+          minLength: 1
+          maxLength: 1000
+    SopAnswer:
+      type: object
+      required:
+      - answer
+      - citations
+      - abstained
+      properties:
+        answer:
+          type: string
+        citations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Citation'
+        abstained:
+          type: boolean
+    FeedbackCreate:
+      type: object
+      required:
+      - draft_id
+      - wrong
+      additionalProperties: false
+      properties:
+        draft_id:
+          type: string
+          format: uuid
+        wrong:
+          type: boolean
+        save_as_case:
+          type: boolean
+          description: Save this case to the evaluation set (FR-12).
+        note:
+          type: string
+          maxLength: 1000
+    DocumentUpload:
+      type: object
+      required:
+      - file
+      properties:
+        file:
+          type: string
+          format: binary
+          description: PDF, DOCX or Markdown.
+    DocumentVersion:
+      type: object
+      required:
+      - doc_key
+      - version
+      - status
+      - created_at
+      properties:
+        doc_key:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum:
+          - draft
+          - published
+          - superseded
+          - rolled_back
+        eval_passed:
+          type:
+          - boolean
+          - 'null'
+          description: Null until the eval gate runs.
+        created_at:
+          type: string
+          format: date-time
+        published_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    QualityDashboard:
+      type: object
+      required:
+      - from
+      - to
+      - citation_rate
+      - abstention_rate
+      - latency_p50_ms
+      - latency_p95_ms
+      properties:
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        citation_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        abstention_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        latency_p50_ms:
+          type: integer
+          minimum: 0
+        latency_p95_ms:
+          type: integer
+          minimum: 0
+    CostDashboard:
+      type: object
+      required:
+      - from
+      - to
+      - conversations
+      - cost_per_conversation_kobo
+      - total_cost_kobo
+      properties:
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        conversations:
+          type: integer
+          minimum: 0
+        cost_per_conversation_kobo:
+          type: integer
+          minimum: 0
+        total_cost_kobo:
+          type: integer
+          minimum: 0
+    LoginRequest:
+      type: object
+      required:
+      - email
+      - password
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 1
+          maxLength: 200
+    TokenResponse:
+      type: object
+      required:
+      - access_token
+      - token_type
+      - expires_in
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          enum:
+          - bearer
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Seconds until the token expires.
+    AccountCreate:
+      type: object
+      required:
+      - name
+      - email
+      - password
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Fictional names only.
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 12
+          maxLength: 200
+          description: Initial password, set by the creator. Changing it is not in version 1 (password reset is out of scope).
+    DailyLimitUpdate:
+      type: object
+      required:
+      - daily_limit_kobo
+      additionalProperties: false
+      properties:
+        daily_limit_kobo:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: Daily refund limit in kobo. Null removes it.
+    UserLimit:
+      type: object
+      required:
+      - id
+      - role
+      - daily_limit_kobo
+      properties:
+        id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum:
+          - staff
+          - admin
+        daily_limit_kobo:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+    EligibleAssignee:
+      type: object
+      required:
+      - user_id
+      - role
+      - open_items
+      - remaining_today_kobo
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum:
+          - staff
+          - admin
+        open_items:
+          type: integer
+          minimum: 0
+          description: Open tickets and open refund requests assigned to this person.
+        remaining_today_kobo:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: Daily limit minus approvals today minus open refund requests assigned now. For tickets without an amount, this is null.
+    EligibleAssigneeList:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          description: Lowest open-item count first. Ties go to the person assigned longest ago.
+          items:
+            $ref: '#/components/schemas/EligibleAssignee'
+    AssignRequest:
+      type: object
+      required:
+      - user_id
+      additionalProperties: false
+      properties:
+        user_id:
+          type: string
+          format: uuid
+    LimitIncreaseCreate:
+      type: object
+      required:
+      - refund_request_id
+      - requested_limit_kobo
+      - reason
+      additionalProperties: false
+      properties:
+        refund_request_id:
+          type: string
+          format: uuid
+        requested_limit_kobo:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Must not contain customer personal data.
+    LimitIncrease:
+      type: object
+      required:
+      - id
+      - requester_user_id
+      - refund_request_id
+      - requested_limit_kobo
+      - reason
+      - status
+      - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        requester_user_id:
+          type: string
+          format: uuid
+        refund_request_id:
+          type: string
+          format: uuid
+        requested_limit_kobo:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+        status:
+          type: string
+          enum:
+          - pending
+          - approved
+          - rejected
+        decision_note:
+          type:
+          - string
+          - 'null'
+        created_at:
+          type: string
+          format: date-time
+        decided_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    LimitIncreasePage:
+      type: object
+      required:
+      - items
+      - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LimitIncrease'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    LimitIncreaseDecision:
+      type: object
+      required:
+      - decision
+      additionalProperties: false
+      properties:
+        decision:
+          type: string
+          enum:
+          - approved
+          - rejected
+        note:
+          type: string
+          maxLength: 1000
+    AuditEvent:
+      type: object
+      required:
+      - id
+      - occurred_at
+      - actor_user_id
+      - actor_role
+      - action
+      - entity_type
+      - outcome
+      - request_id
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          description: Monotonic integer.
+        occurred_at:
+          type: string
+          format: date-time
+          description: UTC.
+        actor_user_id:
+          type: string
+          format: uuid
+        actor_role:
+          type: string
+          enum:
+          - staff
+          - admin
+          - super_admin
+          - system
+        action:
+          type: string
+          description: Dot-separated, from a fixed list. For example, `refund_request.approved`.
+        entity_type:
+          type: string
+        entity_id:
+          type:
+          - string
+          - 'null'
+        outcome:
+          type: string
+          enum:
+          - success
+          - denied
+          - failed
+        changed_fields:
+          type: array
+          items:
+            type: string
+          description: Field names only.
+        before:
+          type:
+          - object
+          - 'null'
+          description: Non-personal values before the change. Phone numbers, names and addresses are never written here.
+        after:
+          type:
+          - object
+          - 'null'
+          description: Non-personal values after the change.
+        ip_address:
+          type:
+          - string
+          - 'null'
+        request_id:
+          type: string
+    AuditEventPage:
+      type: object
+      required:
+      - items
+      - next_cursor
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_cursor:
+          type:
+          - string
+          - 'null'
+    Health:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - ready
+    ServicesHealth:
+      type: object
+      required:
+      - overall
+      - components
+      properties:
+        overall:
+          type: string
+          enum:
+          - ok
+          - degraded
+          - down
+        components:
+          type: array
+          items:
+            $ref: '#/components/schemas/ComponentHealth'
+    ComponentHealth:
+      type: object
+      required:
+      - name
+      - status
+      - checked_at
+      properties:
+        name:
+          type: string
+          enum:
+          - database
+          - knowledge
+          - assistant
+        status:
+          type: string
+          enum:
+          - ok
+          - down
+        checked_at:
+          type: string
+          format: date-time
+          description: UTC time of the check.
