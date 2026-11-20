@@ -1,0 +1,458 @@
+# Week 4: FastAPI, Validation, Tests, Docker & CI
+
+**Harbour Learning Programme · Month 1 · Week 4: team briefing**
+
+> **The whole week in one line:** Each layer does one job. The **router** speaks HTTP, the **service** decides, and the **repository** talks to the database. **Tests, Docker and CI** then prove it works on every machine, every time.
+
+| | |
+|---|---|
+| **Sources** | Harbour [README](../README.md) (`learn` branch) and the 6 notebooks in this `week-4/` folder |
+| **Mini-project** | Library Loans API (Weeks 1–4): **this is the delivery week** |
+| **Friday milestone** | Mini-project 1 demo and Month 1 check |
+| **Harbour step** | Harbour core API skeleton: FastAPI, SQL, tests and Docker |
+| **Month 1 checkpoint** | The API runs from a fresh clone, with tests and CI passing. Each member can explain one request from input to database and back. |
+
+> ⚠️ **Two topics have no notebook in the folder yet:** Member 5 (GitHub Actions CI) and Member 7 (Pydantic models & validation errors). Those sections are written from the README plus standard practice. The owners may want to check them against what they plan to teach.
+
+---
+
+## Contents
+
+1. [Where Week 4 fits](#1-where-week-4-fits)
+2. [Week 4 at a glance](#2-week-4-at-a-glance)
+3. [The big picture: one request, end to end](#3-the-big-picture-one-request-end-to-end)
+4. [Part A: Building the API](#4-part-a-building-the-api)
+5. [Part B: Making it run anywhere](#5-part-b-making-it-run-anywhere)
+6. [Part C: Proving it works](#6-part-c-proving-it-works)
+7. [How Week 4 connects to the whole project](#7-how-week-4-connects-to-the-whole-project)
+8. [Decisions the team must agree on before Friday](#8-decisions-the-team-must-agree-on-before-friday)
+9. [The 10 rules to remember](#9-the-10-rules-to-remember)
+10. [Quick-fire check for the team](#10-quick-fire-check-for-the-team)
+
+---
+
+## 1. Where Week 4 fits
+
+Week 4 is where the pieces from the last three weeks **join into one working product**.
+
+| Week | What we built | How it shows up in Week 4 |
+|---|---|---|
+| 1 | Python + Git | Clean code, small PRs, explain-before-merge |
+| 2 | REST API contract (OpenAPI) | Becomes the **routes**, status codes and error bodies |
+| 3 | PostgreSQL schema + Alembic | Becomes the **models**, repository queries and transactions |
+| **4** | **FastAPI + Pydantic + SQLAlchemy + tests + Docker + CI** | **A real API that runs anywhere and checks itself on every PR** |
+
+**Why it matters:** the Month 1 checkpoint is about understanding, not just working code. Every member must be able to trace **one request from the HTTP call to the database row and back**. This briefing is built around that trace.
+
+---
+
+## 2. Week 4 at a glance
+
+| Owner / day | Topic | What the class must be able to do | Friday build |
+|---|---|---|---|
+| M1 · Mon | Layering: routers, services, repositories | Say which code belongs in each layer, and why | Move borrowing rules into the service layer |
+| M6 · Mon | FastAPI routing, path & query params, uvicorn | Define routes; explain path vs query parameters | Implement book and loan endpoints |
+| M7 · Mon | Pydantic models & validation errors | Write a request model that rejects bad input with a useful message | Add validation: ISBN format, due-date rules |
+| M8 · Mon | psycopg 3 + SQLAlchemy 2.0 sessions | Explain what a session is and when it commits or closes | Implement the loan repository with SQLAlchemy |
+| M2 · Wed | pytest fixtures, TestClient (httpx), test DB | Write fixtures and tests against a real database | Tests for loan endpoints, including invalid input |
+| M3 · Wed | Dockerfile + Docker Compose (API + Postgres) | Explain image vs container; run API + DB together | Compose file with a health check, verified running |
+| M4 · Wed | Config with pydantic-settings + env vars | Load settings from the environment; never commit secrets | Settings from env vars, documented without secrets |
+| M5 · Wed | GitHub Actions: ruff, mypy, pytest on every PR | Read a CI workflow; explain why a failing test blocks a merge | CI workflow with a green build on a PR |
+
+*The sections below group the topics as **build the API → make it run anywhere → prove it works.***
+
+---
+
+## 3. The big picture: one request, end to end
+
+If the team remembers one diagram from this week, make it this one. It answers the Month 1 checkpoint question.
+
+```text
+ CLIENT   POST /v1/loans  {"member_id": ..., "copy_barcode": ...}
+   │
+   ▼
+ UVICORN         the server: listens on a port, hands the request to FastAPI     (M6)
+   │
+   ▼
+ ROUTER          matches method + path; Pydantic validates the body              (M6, M7)
+   │             bad shape?  ──► 422, before our code even runs
+   ▼
+ SERVICE         applies the business rules (exists? available? limit? fines?)   (M1)
+   │             rule broken? ──► domain error ──► router maps it to 404 / 409
+   │             owns COMMIT / ROLLBACK for the whole operation
+   ▼
+ REPOSITORY      SQLAlchemy 2.0 builds SQL from a Session                        (M8)
+   │
+   ▼
+ psycopg 3 ──► POSTGRESQL      constraints from Week 3 are the final gate
+   │
+   ▼
+ back up the chain ──► 201 Created + Location header + JSON body
+
+ Around all of it:
+   • settings (DATABASE_URL, DEBUG…) come from env vars via pydantic-settings    (M4)
+   • API + Postgres run together in Docker Compose with health checks           (M3)
+   • pytest drives this whole path through TestClient against a test DB         (M2)
+   • GitHub Actions runs ruff + mypy + pytest on every PR, and red blocks merge (M5)
+```
+
+---
+
+## 4. Part A: Building the API
+
+### 4.1 FastAPI routing, path & query parameters, uvicorn
+*Member 6 · Monday · notebook: `FastAPI_Routing_Path_Query_Parameters.ipynb`*
+
+> **In one sentence:** A **route** connects an HTTP **method + path** to a Python function. Inputs come from the **path** (which resource), the **query** (options such as search and paging) or the **body** (data to create). **Uvicorn** is the server that makes the app reachable.
+
+**Key concepts**
+- `GET /v1/books` and `POST /v1/books` are **different routes**. The method matters as much as the path.
+- **Path vs query vs body:**
+
+  | Location | Example | Use it for |
+  |---|---|---|
+  | Path | `GET /v1/books/9780306406157` | Picking **one** resource (required) |
+  | Query | `GET /v1/books?search=lantern&limit=5` | Filtering, searching, paging (often optional, with defaults) |
+  | Body | `POST /v1/books` + JSON | Data you're creating or changing |
+- **FastAPI is the framework; Uvicorn is the server.** `uvicorn module:app --reload`, where `--reload` is for development only.
+- **Run SQL safely with psycopg:** use the `%s` placeholder plus a tuple of values. **Never** build SQL with f-strings, because that opens the door to SQL injection.
+- **One request = one transaction:** borrowing inserts the loan **and** marks the copy on loan, and both commit together or not at all.
+- **Row locks (`FOR UPDATE`)** stop two requests from grabbing the last copy at the same time. The partial unique index from Week 3 is the backstop.
+- FastAPI auto-generates interactive docs at `/docs`.
+
+**Watch out**
+- Writing a route decorator doesn't save anything. You still have to write (or call) the SQL.
+- Don't invent routes the contract doesn't have (e.g. DELETE) just because the plan says "CRUD".
+- Don't return success before the transaction has committed.
+- Don't put blocking database calls inside `async def` handlers. Use plain `def` with a synchronous driver.
+
+**Friday build:** Implement the book and loan endpoints from the agreed contract.
+
+**Why it matters for the project:** Routes are the **public face** of Harbour. The Week 2 OpenAPI contract becomes real code here, and every later feature (triage, Q&A, agents, the React UI) is reached through routes like these.
+
+---
+
+### 4.2 Pydantic models & validation errors
+*Member 7 · Monday · ⚠️ no notebook in the folder yet, so this is based on the README and examples in the other notebooks*
+
+> **In one sentence:** A Pydantic model is a **contract for data coming in and going out**. If the request doesn't match, FastAPI rejects it with a **422** and a clear message *before your code runs*.
+
+**Key concepts**
+- **Request models** describe what a client may send. **Response models** describe what we send back, so we never leak internal fields.
+- **Field rules** do the simple checks for you: `Field(ge=1)`, `Field(min_length=1, max_length=300)`, `Field(pattern=...)`.
+- **`extra="forbid"`** rejects unexpected fields, so a typo like `book_ID` fails loudly instead of being silently ignored:
+  ```python
+  class BorrowRequest(BaseModel):
+      model_config = ConfigDict(extra="forbid")
+      member_id: int = Field(ge=1)
+      book_id: int = Field(ge=1)
+  ```
+- **Custom validators** handle rules a type can't express: `@field_validator` for one field (e.g. an ISBN checksum) and `@model_validator` for rules across fields (e.g. a due date after the borrow date).
+- **A 422 body tells the client exactly what's wrong:** the location (`body → isbn`), a message and an error type.
+- **`from_attributes=True`** lets a response model read directly from a SQLAlchemy object.
+
+**Watch out**
+- A regex like `^\d{13}$` checks the **shape** of an ISBN, not its **checksum**. Decide whether the checksum is required.
+- Pydantic gives friendly errors, but **keep the database constraints too** (Week 3 rule: validate in both layers).
+- **Model ≠ schema:** SQLAlchemy *models* describe tables, and Pydantic *schemas* describe API input and output. Don't mix them up.
+
+**Friday build:** Add Pydantic validation, including ISBN format and due-date rules.
+
+**Why it matters for the project:** This is the foundation of **Month 2**. "Structured outputs" means making an LLM return data that passes a Pydantic model, and rejecting or retrying when it doesn't. The skill learned here on ISBNs is the same one we'll use on AI output.
+
+---
+
+### 4.3 Layering: routers, services and repositories
+*Member 1 · Monday · notebook: `layering.ipynb`*
+
+> **In one sentence:** **Three layers, three kinds of decision.** The router handles HTTP, the service enforces the business rules, and the repository reads and writes data. **Calls only go downward.**
+
+**Key concepts**
+- **Router = receptionist.** It receives the request, validates it, calls the service, and turns the result or error into a response. No `if` statements about borrowing, no date maths, no SQL.
+- **Service = the rules.** Does the member exist? Is a copy free? Is the member at their loan limit? Do they owe too much in fines? **No HTTP here** (no `HTTPException`, no status codes) and **no SQL strings**.
+- **Repository = data access.** It answers *factual* questions ("how many open loans does member 4 have?"). **The service decides policy** ("may member 4 borrow right now?").
+- **The service owns `commit()` / `rollback()`, and the repository never commits.** Only the service knows whether the *whole* operation succeeded.
+- **`domain/errors.py`** sits under all the layers. The service raises `BookNotAvailable`, and **one dictionary** in the router maps it to 409.
+- **Arrows only point down:** router → service → repository → database. That's why the service can be reused by a test, a script, a background job, and later **an agent**.
+- **The three-question test:** Is it about HTTP? Router. Is it a business decision? Service. Is it reading or saving data? Repository.
+
+**Watch out**
+- Hiding a rule inside a repository query (e.g. excluding members with fines in the SQL) makes the rule **invisible** to anyone reading the service.
+- "It works either way" is true. The difference is **who else can use the rules**. Rules that live in a router can only be used through HTTP.
+
+**Friday build:** Move the borrowing rules into the service layer, and delete `legacy/unlayered.py` in the same PR so the change shows in the diff.
+
+**Why it matters for the project:** This is **the most important architecture idea in the programme**. Harbour's Week 5 "service layer with two providers", the Month 4 agent tools, and background jobs all depend on rules living in services that don't need HTTP.
+
+---
+
+### 4.4 Database access: psycopg 3 & SQLAlchemy 2.0 sessions
+*Member 8 · Monday · notebook: `DatabaseAcess_psycopg3_sqlalchemy2_guide.ipynb`*
+
+> **In one sentence:** **psycopg 3** is the translator between Python and Postgres, and **SQLAlchemy 2.0** turns Python objects into SQL. A **Session** is a short-lived workspace for **one unit of work**: open → work → **commit or rollback** → **always close**.
+
+**Key concepts**
+- **The stack:** your code → SQLAlchemy (builds SQL, maps rows to objects) → psycopg 3 (sends it) → PostgreSQL. SQLAlchemy **doesn't replace SQL**; it writes it for you.
+- **URL format:** `postgresql+psycopg://user:pass@host:5432/db`. The `+psycopg` part selects the psycopg 3 driver.
+- **Engine vs Session:**
+  - **Engine:** created **once** at startup and holds the connection pool.
+  - **Session:** created **per request** and closed when the request ends.
+- **Session lifecycle:**
+
+  | Step | Call | Meaning |
+  |---|---|---|
+  | Stage | `session.add(obj)` | Tracked in memory, not saved yet |
+  | Flush | `session.flush()` | SQL sent inside the transaction (you get IDs) but **not committed** |
+  | Commit | `session.commit()` | Everything saved permanently, together |
+  | Rollback | `session.rollback()` | Everything since the last commit is undone |
+  | Close | `session.close()` / end of `with` | Connection returned to the pool, **always** |
+- **FastAPI dependency:** `get_db()` opens a session, `yield`s it to the route, and closes it in `finally`.
+- **SQLAlchemy 2.0 style:** `DeclarativeBase`, `Mapped[...]`, `mapped_column(...)`, `select(...)`.
+
+**Watch out**
+- **Never share one Session across concurrent requests.**
+- A session that's never closed leaks connections until the pool runs dry.
+- ⚠️ This notebook's `LoanRepository` calls `commit()` itself, but the layering notebook says **only the service commits**. See [Decisions](#8-decisions-the-team-must-agree-on-before-friday).
+
+**Friday build:** Implement the loan repository with SQLAlchemy.
+
+**Why it matters for the project:** Every Harbour feature that stores something uses this pattern. Examples include call logs (Week 5), documents and chunks (Month 3), and agent state (Month 4). Getting session lifetime and commit ownership right now prevents half-saved data later.
+
+---
+
+## 5. Part B: Making it run anywhere
+
+### 5.1 Configuration with pydantic-settings & environment variables
+*Member 4 · Wednesday · notebook: `configuration_with_pydantic_settings_and_environment_variables.ipynb`*
+
+> **In one sentence:** Settings like the database URL, debug mode and API keys live **outside the code** in environment variables. **pydantic-settings** loads and type-checks them at startup, and **real secrets never go into Git**.
+
+**Key concepts**
+- **Environment variable:** a named value given to the running program (`export APP_NAME=...`, read with `os.getenv`).
+- **A settings class:**
+  ```python
+  class Settings(BaseSettings):
+      app_name: str = "Library API"   # has a default
+      debug: bool = False
+      port: int = 8000
+      database_url: str               # required: no default, so startup fails if missing
+      model_config = SettingsConfigDict(env_file=".env")
+  ```
+- Names map automatically (`database_url` ↔ `DATABASE_URL`), and types are converted (`"8000"` → `8000`, `"true"` → `True`).
+- **Fail fast:** `PORT=hello` raises a validation error **at startup**, not halfway through a user's request.
+- **The three files:**
+  - `.env`: real local values. **Never commit it.**
+  - `.env.example`: placeholders. **Commit it** as a guide for teammates.
+  - `.gitignore`: lists `.env` and `.venv/`. **Commit it.**
+
+**Watch out**
+- `.gitignore` **doesn't remove** a secret that's already been committed. If one leaks, **revoke or rotate it**.
+- Don't print settings that contain passwords or tokens, even in a demo.
+- `.venv` (Python packages) and environment variables (settings) are different things.
+
+**Friday build:** Load settings from environment variables and document each one (required or default) **without secrets**.
+
+**Why it matters for the project:** From Week 5, Harbour holds **LLM provider API keys**. The Month 2 checkpoint explicitly requires that the system "keeps secrets out of git". The same settings class also feeds Docker Compose and CI.
+
+---
+
+### 5.2 Dockerfile & Docker Compose for API and Postgres
+*Member 3 · Wednesday · notebook: `Week_4_Member_3_Dockerfile_and_Compose_Lesson.ipynb`*
+
+> **In one sentence:** An **image** is a frozen recipe and a **container** is a running dish made from it. **Docker Compose** starts the API and Postgres together on a private network, with **health checks** so the API waits until the database is ready.
+
+**Key concepts**
+- **Image vs container:** an image is read-only layers (like a Python class). A container is a running instance with a thin writable layer (like an object). Delete the container and that layer is gone, which is why **Postgres needs a named volume**.
+- **Four Dockerfile rules:**
+  1. Use `.dockerignore` to keep out `.env`, `.git` and `.venv`.
+  2. Copy `pyproject.toml` + `uv.lock` **before** `app/`, so code edits don't re-download packages (layer caching).
+  3. Run as a **non-root user**.
+  4. Bind Uvicorn to **`0.0.0.0`**, not `127.0.0.1`, or nothing outside the container can reach it.
+- **Compose essentials:**
+  - Connect to the database by **service name** (`@db:5432`), not `localhost`.
+  - Store data in a named volume (`postgres_data`).
+  - Health-check the database with `pg_isready`.
+  - Start the API with `depends_on: condition: service_healthy`.
+- **A real `/health` endpoint** runs `SELECT 1` against Postgres and returns **200** or **503**. Returning `{"ok": true}` without checking would hide a wrong password.
+- **Volume lifecycle:** `stop` and `down` keep your data. **`down -v` deletes the database.**
+
+**Watch out**
+- `localhost` inside the API container means *the API container itself*, not the database.
+- Plain `depends_on` only waits for the container to **start**, not for Postgres to be **ready**.
+- The notebook's audit checks the file text, not whether the containers actually run. Prove it with `docker compose ps` showing `(healthy)` and `curl /health` returning 200.
+
+**Friday build:** Write the Compose file with a health check and verify it runs.
+
+**Why it matters for the project:** "Works on my laptop" ends here. Harbour's Week 4 skeleton must run in Docker, and Week 20 takes the same containers to **Kubernetes (kind)**. The health endpoint you write now becomes the readiness probe there.
+
+---
+
+## 6. Part C: Proving it works
+
+### 6.1 pytest fixtures, TestClient & a test database
+*Member 2 · Wednesday · notebook: `fixtures-and-test-database.ipynb`*
+
+> **In one sentence:** **Fixtures** build what a test needs and clean up afterwards. **TestClient** calls the app without starting a server. Every test runs against a **separate database you're allowed to destroy**.
+
+**Key concepts**
+- **The four pieces:** pytest (runs `test_*` functions) · fixtures (setup and teardown) · TestClient (in-process HTTP) · a test DB (`library_test`, never `library`).
+- **Fixture shape:** setup code goes **above** `yield` and cleanup **below** it. Cleanup runs even if the test fails.
+- **Scope:**
+  - `scope="session"` for expensive things built once (the engine and schema).
+  - `scope="function"` (the default) for anything that holds state (a session, seeded rows, the client).
+- **Dependency override:** `app.dependency_overrides[get_session] = lambda: session` points the app at the test session.
+- **404 vs 409 vs 422:**
+
+  | Code | Meaning | Who decides |
+  |---|---|---|
+  | 404 | The thing you named doesn't exist | Your code |
+  | 409 | It exists, but conflicts with its current state (e.g. the copy is already out) | Your code |
+  | 422 | The body doesn't match the model | Pydantic, before your code runs |
+- **`@pytest.mark.parametrize`:** one test function, many input cases, each reported separately.
+- **Read a failure from the `E` line first:** `E assert 201 == 200` shows what actually happened and what the test expected.
+- **Two testing styles:** call through the client to check behaviour, and through the session to check facts the response hides (e.g. the copy is now `on_loan`).
+
+**Watch out**
+- Importing `app` in individual test files can make overrides miss, so tests quietly hit the real DB. **Import once, in `conftest.py`.**
+- Reusing one session across tests leaks state between them.
+- Testing only the happy path. Endpoints are usually right about 201 and wrong about 404, 409 and 422.
+- Because the app **commits**, rolling back after a test doesn't clean up. The `seeded` fixture deletes rows in foreign-key order instead.
+
+**Friday build:** Write tests for the loan endpoints, **including invalid input**.
+
+**Why it matters for the project:** The same fixtures work for Harbour unchanged. Point them at `harbour_test` and seed documents instead of books. Tests are also the seed of **evaluation**: Week 7 builds an eval set, and Week 19 turns it into a gate that blocks bad changes.
+
+---
+
+### 6.2 GitHub Actions: ruff, mypy & pytest on every pull request
+*Member 5 · Wednesday · ⚠️ no notebook in the folder yet, so this is based on the README and standard practice*
+
+> **In one sentence:** **CI** is a robot reviewer that runs **lint (ruff), type checks (mypy) and tests (pytest)** on every PR. If any step fails, the PR is **blocked from merging**.
+
+**Key concepts**
+- A workflow is a YAML file in `.github/workflows/`. It runs `on: pull_request` (and usually on `push` to the main branch).
+- **What each tool catches:**
+  - **ruff:** style problems, unused imports, likely bugs (fast linting and formatting checks).
+  - **mypy:** type mistakes, e.g. passing a `str` where an `int` is expected.
+  - **pytest:** behaviour, i.e. whether the code actually does what the contract says.
+- **Our tests need a real Postgres**, so CI starts one as a **service container** with a health check, just like Compose.
+- **A failing check blocks the merge** only if the branch has **branch protection with required status checks** turned on. Set it up.
+- **A minimal shape** (action versions are illustrative, so check the current releases):
+  ```yaml
+  name: ci
+  on: [pull_request]
+  jobs:
+    check:
+      runs-on: ubuntu-latest
+      services:
+        postgres:
+          image: postgres:16-alpine
+          env: { POSTGRES_USER: test, POSTGRES_PASSWORD: test, POSTGRES_DB: library_test }
+          ports: ["5432:5432"]
+          options: >-
+            --health-cmd "pg_isready -U test" --health-interval 5s --health-retries 5
+      env:
+        DATABASE_URL: postgresql+psycopg://test:test@localhost:5432/library_test
+      steps:
+        - uses: actions/checkout@v4
+        - uses: astral-sh/setup-uv@v6
+        - run: uv sync --frozen
+        - run: uv run ruff check .
+        - run: uv run ruff format --check .
+        - run: uv run mypy app
+        - run: uv run pytest -q
+  ```
+  *(In CI the job runs on the runner itself, so `localhost` is correct here, unlike inside a Compose container.)*
+
+**Watch out**
+- Real secrets belong in **GitHub Secrets**, never in the workflow file.
+- A workflow that's green but skips tests proves nothing. Check that pytest actually collected tests.
+- Fix the code, not the check. Don't silence a rule just to go green.
+
+**Friday build:** Set up the CI workflow with ruff, mypy and pytest, and get a green build on a pull request.
+
+**Why it matters for the project:** CI is how the team's rules become automatic. In **Week 19** Harbour adds an **evaluation gate** to this same GitHub Actions pipeline, so a change that makes AI answers worse is blocked just like a failing test.
+
+---
+
+## 7. How Week 4 connects to the whole project
+
+Week 4 produces the **skeleton every later month builds on.** Here's where this week's ideas come back:
+
+| When | What comes back | Week 4 idea it relies on |
+|---|---|---|
+| Friday (Harbour) | Harbour core API skeleton: FastAPI, SQL, tests, Docker | All eight topics, rewritten in Harbour's own code |
+| Week 5 | Harbour service layer with two LLM providers + call logging | **Layering** (the service swaps providers and routers don't change), **settings** for API keys |
+| Week 6 | Validated model outputs with safe retries | **Pydantic** models, now applied to LLM output |
+| Week 7 | Small evaluation set | **pytest** habits: fixtures, parametrised cases |
+| Month 3 | Knowledge service storing documents and chunks | **Sessions, repositories**, test DB seeded with documents |
+| Weeks 15–18 | Agent tools, approvals, budgets | **Services callable without HTTP**: the agent calls the same rules |
+| Week 19 | Eval gate blocks a regression in CI | **GitHub Actions** pipeline from this week |
+| Week 20 | Stack on Kubernetes (kind) with traces | **Docker images, health checks** |
+| Week 21 | React frontend + `SKIP LOCKED` background jobs | **Routes/contract** for the UI; locking already seen in the repository |
+
+> **Harbour this Friday (13:00–17:00):** Build Harbour's own skeleton: routers, services and repositories; settings from env; Compose with a Postgres health check; a test DB with fixtures; and CI on PRs. Team rule 8: **no importing library code.** Rewrite the patterns for Harbour's domain.
+
+---
+
+## 8. Decisions the team must agree on before Friday
+
+The notebooks were written separately and **contradict each other in places.** The **agreed API contract (Week 2) should be the tiebreaker.** Settle these before the integration PRs:
+
+| # | Question | What the notebooks currently say |
+|---|---|---|
+| 1 | **Who commits?** | Layering: **only the service** commits, never the repository. DB-access notebook: `LoanRepository` commits itself. Fixtures notebook: the endpoint commits. Pick one. The layering rule (service owns the transaction) is the safest. |
+| 2 | **Business rule numbers** | Layering: max **5** open loans, fine **200 kobo/day**, blocked if unpaid fines are **over ₦1,000**. FastAPI notebook: max **3** open loans, **50 kobo/day capped at 2,000**, blocked by **any** unpaid fine or suspension. |
+| 3 | **URL prefix** | `/api/v1/...` (layering) vs `/v1/...` (FastAPI notebook) vs no prefix `/loans` (DB-access, fixtures). |
+| 4 | **Borrow request body** | `member_id + book_id`, where the server picks the copy (layering) vs `member_id + copy_barcode` (FastAPI notebook, follows the contract) vs `copy_id + member_id + optional due_on` (fixtures). The FastAPI notebook says **the server sets the 14-day due date**, but the fixtures version lets the client send one. |
+| 5 | **ID types** | Members: UUID (FastAPI) vs integer (layering, DB access) vs text `MB-01` (fixtures). Books: ISBN as key vs integer or text ID. This links to the Week 3 open decision on ID style. |
+| 6 | **Error response shape** | Contract: `{code, message}`. DB-access and fixtures notebooks use FastAPI's default `{"detail": ...}`, and DB access maps rule failures to **400** instead of 404/409. |
+| 7 | **Driver** | The plan says psycopg 3 (`postgresql+psycopg://`), but the layering notebook's verification cell uses `postgresql+psycopg2://`. |
+| 8 | **Raw psycopg vs SQLAlchemy** | The FastAPI notebook writes raw SQL in routes (for teaching), but the integrated app should use SQLAlchemy repositories, as that notebook itself notes. |
+| 9 | **Schema in tests** | Tests build tables with `Base.metadata.create_all`, while the real app uses Alembic. Consider running `alembic upgrade head` on the test DB so migrations get tested too. |
+| 10 | **Versions** | Docker uses `python:3.13-slim` and `postgres:16-alpine`; the Week 3 setup used Postgres 18. Align the local, Docker and CI versions. |
+
+---
+
+## 9. The 10 rules to remember
+
+1. **Router = HTTP, Service = rules, Repository = data.** Calls only go **down**.
+2. **The service owns commit and rollback.** One business operation = one transaction.
+3. **Path picks the resource, query sets options, body carries the data.**
+4. **Pydantic rejects bad input with a 422 before your code runs.** Keep the DB constraints too.
+5. **404 = not there, 409 = conflicts with current state, 422 = wrong shape.** Test all three.
+6. **Engine once, Session per request, always closed.** Never share a session.
+7. **Never build SQL with f-strings.** Use placeholders or SQLAlchemy.
+8. **Configuration comes from the environment.** `.env` stays local, `.env.example` gets committed, leaked secrets get rotated.
+9. **In Compose, use service names, bind `0.0.0.0`, health-check the DB,** and keep data in a volume (careful with `down -v`).
+10. **Tests run against a database you're allowed to destroy,** and **CI runs them on every PR.** Red blocks merge.
+
+---
+
+## 10. Quick-fire check for the team
+
+<details>
+<summary><b>Click to reveal the answers</b> (try answering first)</summary>
+
+| Question | Answer |
+|---|---|
+| What's the difference between FastAPI and Uvicorn? | FastAPI is the framework that defines behaviour. Uvicorn is the HTTP server that runs it. |
+| Why is search a query parameter but ISBN a path parameter? | The path picks one resource. The query sets options on a collection. |
+| Where does "a member may hold at most N loans" belong? | In the **service**. It's a business rule, not HTTP and not data access. |
+| Why shouldn't the repository call `commit()`? | Only the service knows if the *whole* operation succeeded. Early commits leave half-finished data. |
+| What's the difference between `flush()` and `commit()`? | `flush()` sends the SQL inside the transaction (you get IDs), but it can still be rolled back. `commit()` makes it permanent. |
+| Who returns the 422, you or FastAPI? | FastAPI/Pydantic, before your function runs. |
+| Why does `localhost:5432` fail inside the API container? | `localhost` is the API container itself. Use the service name `db`. |
+| What does `depends_on: condition: service_healthy` add? | The API waits until Postgres passes its health check, not just until the container starts. |
+| Does adding `.env` to `.gitignore` fix a secret that was already pushed? | No. Revoke or rotate it. `.gitignore` only stops future tracking. |
+| Why does a failing test block a merge? | CI runs on the PR, and branch protection makes the check a required status. |
+
+</details>
+
+---
+
+**Team rules that apply this week:**
+- **Explain before merge:** trace your request from route to database and back, without looking at the screen.
+- **Break it on purpose:** for example, a 422 from a bad body, a rollback from an injected failure, an unhealthy container, or a red CI run.
+- **AI disclosure in every PR.**
+- **Honest limits:** list what isn't done yet.
