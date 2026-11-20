@@ -8,3 +8,5 @@ library.json
 _test_run/
 .env
 .venv/
+.vscode/
+.vscode*
